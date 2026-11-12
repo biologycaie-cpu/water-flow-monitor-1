@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#10243a">
+  <title>ESP32 Water Flow Monitor</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1726; --panel:#14263b; --muted:#a9bbcf; --accent:#38bdf8; --green:#34d399; --red:#fb7185; }
+    * { box-sizing:border-box; }
+    body { margin:0; padding:24px 14px; font-family:Arial, sans-serif; background:linear-gradient(145deg,#0b1726,#102b43); color:#f4f8fc; }
+    main { max-width:760px; margin:0 auto; }
+    header { text-align:center; margin:10px 0 24px; }
+    h1 { margin:0 0 8px; font-size:clamp(1.7rem,5vw,2.4rem); }
+    .sub { color:var(--muted); margin:0; }
+    .panel { background:rgba(20,38,59,.96); border:1px solid #29435f; border-radius:18px; padding:20px; margin:14px 0; box-shadow:0 12px 32px #0003; }
+    .status-row { display:flex; align-items:center; gap:10px; justify-content:center; margin:8px 0 18px; color:var(--muted); }
+    .dot { width:10px; height:10px; border-radius:50%; background:#94a3b8; }
+    .dot.connected { background:var(--green); box-shadow:0 0 12px var(--green); }
+    .actions { display:flex; flex-wrap:wrap; gap:10px; justify-content:center; }
+    button { border:0; border-radius:12px; padding:13px 20px; font-weight:700; font-size:1rem; cursor:pointer; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    #connectBtn { background:var(--accent); color:#062033; }
+    #disconnectBtn { background:#33465b; color:#fff; }
+    .metrics { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+    .metric { background:#0e1e30; border-radius:14px; padding:18px 12px; text-align:center; }
+    .metric .label { color:var(--muted); font-size:.92rem; }
+    .metric .value { font-size:clamp(1.7rem,6vw,2.4rem); font-weight:800; margin-top:10px; overflow-wrap:anywhere; }
+    .unit { color:var(--muted); font-size:.9rem; }
+    #message { min-height:1.5em; color:var(--muted); text-align:center; margin:16px 0 0; overflow-wrap:anywhere; }
+    canvas { width:100%; height:180px; display:block; background:#0e1e30; border-radius:12px; }
+    .note { color:var(--muted); line-height:1.5; font-size:.9rem; }
+    .warning { color:#fde68a; }
+    @media(max-width:440px) { .metrics { grid-template-columns:1fr; } .panel { padding:16px; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>💧 Water Flow Monitor</h1>
+    <p class="sub">ESP32 + YF-S201 · Live Bluetooth readings</p>
+  </header>
+
+  <section class="panel">
+    <div class="status-row">
+      <span id="statusDot" class="dot"></span>
+      <span id="statusText">Not connected</span>
+    </div>
+    <div class="actions">
+      <button id="connectBtn">Connect to ESP32</button>
+      <button id="disconnectBtn" disabled>Disconnect</button>
+    </div>
+    <p id="message">Open this page in Chrome on an Android phone, then tap Connect.</p>
+  </section>
+
+  <section class="panel">
+    <div class="metrics">
+      <div class="metric">
+        <div class="label">Current flow rate</div>
+        <div class="value" id="flow">—</div>
+        <div class="unit">litres per minute (L/min)</div>
+      </div>
+      <div class="metric">
+        <div class="label">Total water measured</div>
+        <div class="value" id="total">—</div>
+        <div class="unit">litres (L)</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2 style="margin-top:0;font-size:1.15rem">Flow history</h2>
+    <canvas id="chart" width="700" height="180" aria-label="Flow rate history chart"></canvas>
+    <p class="note">The graph shows recent flow-rate readings received from the ESP32.</p>
+  </section>
+
+  <section class="panel">
+    <h2 style="margin-top:0;font-size:1.05rem">Connection help</h2>
+    <p class="note">This page uses Web Bluetooth. It needs a supported browser (normally Chrome on Android) and a secure website address (HTTPS, or localhost for testing). A normal file opened directly from Downloads may not support Bluetooth.</p>
+    <p class="note warning">Water-only demonstration. Keep the electronics dry and use only a properly protected, 3.3V-safe sensor signal connection to the ESP32 GPIO.</p>
+  </section>
+</main>
+
+<script>
+(() => {
+  const SERVICE_UUID = "12345678-1234-1234-1234-123456789000";
+  const CHARACTERISTIC_UUID = "12345678-1234-1234-1234-123456789001";
+
+  const connectBtn = document.getElementById("connectBtn");
+  const disconnectBtn = document.getElementById("disconnectBtn");
+  const statusText = document.getElementById("statusText");
+  const statusDot = document.getElementById("statusDot");
+  const message = document.getElementById("message");
+  const flowEl = document.getElementById("flow");
+  const totalEl = document.getElementById("total");
+  const canvas = document.getElementById("chart");
+  const ctx = canvas.getContext("2d");
+
+  let device = null;
+  let characteristic = null;
+  let flowHistory = [];
+
+  function setStatus(connected, text) {
+    statusText.textContent = text;
+    statusDot.classList.toggle("connected", connected);
+    connectBtn.disabled = connected;
+    disconnectBtn.disabled = !connected;
+  }
+
+  function showMessage(text) {
+    message.textContent = text;
+  }
+
+  function drawChart() {
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    ctx.strokeStyle = "#29435f";
+    ctx.lineWidth = 1;
+    for (let i = 1; i <= 4; i++) {
+      const y = (h - 20) * i / 5 + 5;
+      ctx.beginPath(); ctx.moveTo(35, y); ctx.lineTo(w - 10, y); ctx.stroke();
+    }
+    ctx.fillStyle = "#a9bbcf";
+    ctx.font = "12px Arial";
+    ctx.fillText("L/min", 8, 15);
+    if (flowHistory.length < 2) return;
+
+    const max = Math.max(1, ...flowHistory) * 1.15;
+    const plotW = w - 50, plotH = h - 35;
+    ctx.strokeStyle = "#38bdf8";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    flowHistory.forEach((value, index) => {
+      const x = 40 + (index / (flowHistory.length - 1)) * plotW;
+      const y = 10 + plotH - (value / max) * plotH;
+      if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+
+  function handleValueChanged(event) {
+    try {
+      const raw = new TextDecoder().decode(event.target.value);
+      const data = JSON.parse(raw);
+      const flow = Number(data.flow_lpm);
+      const total = Number(data.total_litres);
+
+      if (!Number.isFinite(flow) || !Number.isFinite(total)) {
+        throw new Error("The ESP32 sent data in an unexpected format.");
+      }
+
+      flowEl.textContent = flow.toFixed(2);
+      totalEl.textContent = total.toFixed(3);
+      flowHistory.push(Math.max(0, flow));
+      if (flowHistory.length > 40) flowHistory.shift();
+      drawChart();
+      showMessage("Live readings received from WaterFlow-ESP32.");
+    } catch (error) {
+      showMessage("Could not read sensor data: " + error.message);
+    }
+  }
+
+  function handleDisconnected() {
+    characteristic = null;
+    setStatus(false, "Disconnected");
+    showMessage("Bluetooth disconnected. Tap Connect to try again.");
+  }
+
+  async function connectBluetooth() {
+    if (!("bluetooth" in navigator)) {
+      showMessage("Web Bluetooth is not available in this browser. Open this page in Chrome on Android using an HTTPS website address.");
+      return;
+    }
+
+    try {
+      connectBtn.disabled = true;
+      showMessage("Choose WaterFlow-ESP32 in the Bluetooth device picker…");
+
+      device = await navigator.bluetooth.requestDevice({
+        filters: [{ name: "WaterFlow-ESP32" }],
+        optionalServices: [SERVICE_UUID]
+      });
+
+      device.removeEventListener("gattserverdisconnected", handleDisconnected);
+      device.addEventListener("gattserverdisconnected", handleDisconnected);
+
+      showMessage("Connecting to " + device.name + "…");
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE_UUID);
+      characteristic = await service.getCharacteristic(CHARACTERISTIC_UUID);
+
+      characteristic.removeEventListener("characteristicvaluechanged", handleValueChanged);
+      characteristic.addEventListener("characteristicvaluechanged", handleValueChanged);
+      await characteristic.startNotifications();
+
+      setStatus(true, "Connected to " + device.name);
+      showMessage("Connected. Waiting for water-flow readings…");
+
+      // Read the current value once, then receive live notifications.
+      try {
+        const value = await characteristic.readValue();
+        handleValueChanged({ target: { value } });
+      } catch (_) {
+        // Notifications will provide the next reading.
+      }
+    } catch (error) {
+      setStatus(false, "Not connected");
+      if (error.name === "NotFoundError") {
+        showMessage("No device selected. Tap Connect and choose WaterFlow-ESP32.");
+      } else {
+        showMessage("Bluetooth error: " + error.message);
+      }
+      connectBtn.disabled = false;
+    }
+  }
+
+  async function disconnectBluetooth() {
+    try {
+      if (device && device.gatt && device.gatt.connected) device.gatt.disconnect();
+    } finally {
+      setStatus(false, "Disconnected");
+      showMessage("Disconnected from ESP32.");
+    }
+  }
+
+  connectBtn.addEventListener("click", connectBluetooth);
+  disconnectBtn.addEventListener("click", disconnectBluetooth);
+  setStatus(false, "Not connected");
+  drawChart();
+})();
+</script>
+</body>
+</html>
